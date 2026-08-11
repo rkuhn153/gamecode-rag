@@ -10,11 +10,23 @@ Use it as the “library” next to **[bepinex-mcp](https://github.com/rkuhn153/
 | Tool | Purpose |
 |------|---------|
 | `list_available_projects` | List ingested game indexes |
-| `code_search_and_rerank` | Embed query → vector search → LLM re-rank top snippets |
+| `code_search_and_rerank` | Hybrid search (vectors + symbols) → LLM re-rank top snippets |
 | `code_graph_search` | Callers / callees for a method id |
 | `ingest_new_project` | Build an index from decompiled sources or a Mono assembly path |
 
-Queries for `code_search_and_rerank` should be **full natural-language questions** (not keyword bags).
+Queries for `code_search_and_rerank` should be **full natural-language questions** (not keyword bags). Symbol names (`TakeDamage`, `PlayerController`) still work well thanks to hybrid search.
+
+### How search works
+
+1. **Hybrid retrieval** — dense embeddings + keyword/symbol match over method/class ids, fused with RRF  
+2. **LLM re-rank** — scores the broad set down to a short list  
+3. **Call graph** — optional follow-up via `code_graph_search`
+
+### Embedding models
+
+Default: **`openai/text-embedding-3-small`** via OpenRouter (cheap, fine for many NL queries).
+
+Code-specialized embeddings (e.g. **Voyage Code**, **Qwen3-Embedding**) often do better on “find this C# method” tasks. Override with `EMBEDDING_MODEL` in `.env` — then **re-ingest every project** (old vectors won’t load against a new model). Re-ranker defaults to `gpt-4o-mini` (`RE_RANKER_MODEL`).
 
 ## Requirements
 

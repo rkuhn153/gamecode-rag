@@ -13,6 +13,7 @@ v12:
 
 import os
 import sys
+import re
 import logging
 import json
 import httpx
@@ -31,13 +32,17 @@ load_dotenv(dotenv_path=dotenv_path)
 # ---
 # Configuration
 # ---
-EMBEDDING_MODEL = "openai/text-embedding-3-small"
+# Default is cheap general-purpose. Code-specialized models (e.g. voyage-code-3) often
+# retrieve better for C#; set EMBEDDING_MODEL and re-ingest all projects if you change it.
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "openai/text-embedding-3-small")
 OPENROUTER_EMBED_URL = "https://openrouter.ai/api/v1/embeddings"
-RE_RANKER_MODEL = "openai/gpt-4o-mini"
+RE_RANKER_MODEL = os.environ.get("RE_RANKER_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
-BROAD_SEARCH_K = 25
+BROAD_SEARCH_K = int(os.environ.get("BROAD_SEARCH_K", "25"))
+KEYWORD_SEARCH_K = int(os.environ.get("KEYWORD_SEARCH_K", "25"))
+RRF_K = 60  # Reciprocal Rank Fusion constant
 
 logging.basicConfig(
     level=logging.INFO,
@@ -151,9 +156,11 @@ def cosine_similarity(vec_a: list, vec_b: list):
 
 
 async def real_vector_search(client, question: str = "", vector_db: dict = None, k: int = 25):
+    """Dense retrieval: cosine similarity over stored embeddings. Returns list of node dicts."""
     logger.debug(f"Executing vector search for: {question} (k={k})")
     question_vector = await get_real_embedding(client, question)
-    if not question_vector: return []
+    if not question_vector:
+        return []
 
     scored_nodes = []
     db_vectors = (vector_db or {}).get("vectors", {})
@@ -171,6 +178,128 @@ async def real_vector_search(client, question: str = "", vector_db: dict = None,
             results.append(db_metadata[node_id])
     logger.debug(f"Vector search found {len(results)} relevant nodes.")
     return results
+
+
+def _extract_search_tokens(query: str) -> list[str]:
+    """Pull C#-ish identifiers and dotted names from a natural-language query."""
+    if not query:
+        return []
+    # Prefer longer dotted symbols first (Player.TakeDamage)
+    dotted = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b", query)
+    tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{1,}\b", query)
+    # Drop ultra-common English words that pollute keyword match
+    stop = {
+        "the", "a", "an", "how", "does", "do", "is", "are", "what", "when", "where",
+        "who", "why", "find", "code", "related", "to", "for", "and", "or", "of", "in",
+        "on", "with", "from", "that", "this", "into", "about", "me", "my", "get", "set",
+    }
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in dotted + tokens:
+        key = t.lower()
+        if key in stop or key in seen:
+            continue
+        if len(t) < 2:
+            continue
+        seen.add(key)
+        out.append(t)
+    return out
+
+
+def keyword_symbol_search(query: str = "", vector_db: dict = None, k: int = 25) -> list:
+    """
+    Sparse / symbol retrieval over node Id + content.
+    Strong for exact type/method names (TakeDamage, PlayerController).
+    Returns list of node dicts ordered by keyword score.
+    """
+    db_metadata = (vector_db or {}).get("metadata", {})
+    if not db_metadata:
+        return []
+
+    tokens = _extract_search_tokens(query)
+    if not tokens:
+        return []
+
+    tokens_lower = [t.lower() for t in tokens]
+    scored: list[tuple[float, str]] = []
+
+    for node_id, node in db_metadata.items():
+        nid = (node_id or "").lower()
+        content = (node.get("Content") or "").lower()
+        ntype = (node.get("Type") or "").lower()
+        score = 0.0
+
+        for raw, tok in zip(tokens, tokens_lower):
+            # Exact / full-id hits
+            if nid == tok or nid.endswith("." + tok):
+                score += 12.0
+            elif tok in nid:
+                score += 6.0
+            # Method-style: Id contains Token(
+            if f"{tok}(" in nid or f".{tok}(" in nid:
+                score += 8.0
+            # Content / signature mentions
+            if tok in content:
+                score += 1.5
+            # Prefer method nodes slightly for action-y queries
+            if ntype == "method" and tok in nid:
+                score += 1.0
+            # CamelCase boundary bonus: query "damage" vs "TakeDamage"
+            if len(tok) >= 4 and tok in re.sub(r"([a-z])([A-Z])", r"\1 \2", node_id or "").lower():
+                score += 2.0
+
+        if score > 0:
+            scored.append((score, node_id))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = []
+    for score, node_id in scored[:k]:
+        if node_id in db_metadata:
+            results.append(db_metadata[node_id])
+    logger.debug(f"Keyword/symbol search found {len(results)} nodes (tokens={tokens[:12]})")
+    return results
+
+
+def _rrf_fuse_node_lists(ranked_lists: list, k: int = RRF_K, limit: int = 25) -> list:
+    """Reciprocal Rank Fusion over lists of node dicts (must have 'Id')."""
+    scores: dict[str, float] = {}
+    node_by_id: dict[str, dict] = {}
+
+    for ranked in ranked_lists:
+        if not ranked:
+            continue
+        for rank, node in enumerate(ranked):
+            node_id = node.get("Id")
+            if not node_id:
+                continue
+            node_by_id[node_id] = node
+            scores[node_id] = scores.get(node_id, 0.0) + 1.0 / (k + rank + 1)
+
+    ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [node_by_id[nid] for nid, _ in ordered[:limit] if nid in node_by_id]
+
+
+async def hybrid_search(client, question: str = "", vector_db: dict = None, k: int = 25) -> list:
+    """
+    Hybrid retrieval: dense vectors + keyword/symbol match, fused with RRF.
+    Falls back to whichever side returns results if the other is empty.
+    """
+    dense = await real_vector_search(client, question, vector_db, k=k)
+    sparse = keyword_symbol_search(question, vector_db, k=KEYWORD_SEARCH_K)
+
+    if dense and sparse:
+        fused = _rrf_fuse_node_lists([dense, sparse], limit=k)
+        logger.info(
+            f"Hybrid search: dense={len(dense)} keyword={len(sparse)} fused={len(fused)}"
+        )
+        return fused
+    if dense:
+        logger.info(f"Hybrid search: dense-only ({len(dense)})")
+        return dense[:k]
+    if sparse:
+        logger.info(f"Hybrid search: keyword-only ({len(sparse)})")
+        return sparse[:k]
+    return []
 
 
 def find_downstream_calls(start_node_id: str = "", call_graph: list = None, depth_str: str = "2"):
@@ -237,7 +366,7 @@ async def list_available_projects() -> str:
 
 @mcp.tool()
 async def code_search_and_rerank(project_id: str = "", query: str = "") -> str:
-    """Searches and AI-reranks a *specific project's* codebase for the 5 most relevant C# snippets."""
+    """Hybrid search (dense embeddings + keyword/symbol) then AI re-rank for the top C# snippets in a project."""
     logger.info(f"Executing code_search_and_rerank for project='{project_id}', query='{query}'")
     if not project_id.strip():
         return f"❌ Error: project_id parameter is required. Available projects: {list(GAME_DATABASES.keys())}"
@@ -255,9 +384,9 @@ async def code_search_and_rerank(project_id: str = "", query: str = "") -> str:
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
-            # --- 2. Broad Search ---
-            logger.debug(f"Step 1: Running broad search on '{project_id}'...")
-            broad_search_nodes = await real_vector_search(client, query, vector_db, k=25)
+            # --- 2. Hybrid broad search (dense + keyword/symbol, RRF fuse) ---
+            logger.debug(f"Step 1: Running hybrid search on '{project_id}'...")
+            broad_search_nodes = await hybrid_search(client, query, vector_db, k=BROAD_SEARCH_K)
             if not broad_search_nodes:
                 return "🔍 No relevant code snippets found for that query."
 

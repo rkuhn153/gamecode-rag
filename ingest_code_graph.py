@@ -19,7 +19,8 @@ load_dotenv(dotenv_path=dotenv_path)
 # ---
 # Configuration
 # ---
-EMBEDDING_MODEL = "openai/text-embedding-3-small"
+# Must match gamecode_rag_server.EMBEDDING_MODEL (or re-ingest after changing).
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "openai/text-embedding-3-small")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
