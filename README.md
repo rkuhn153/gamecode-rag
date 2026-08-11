@@ -24,15 +24,26 @@ Queries for `code_search_and_rerank` should be **full natural-language questions
 
 ### Embedding models
 
-Default: **`openai/text-embedding-3-small`** via OpenRouter (cheap, fine for many NL queries).
+Default: **OpenRouter** + **`openai/text-embedding-3-small`** (cheap, fine for many NL queries).
 
-Code-specialized embeddings (e.g. **Voyage Code**, **Qwen3-Embedding**) often do better on “find this C# method” tasks. Override with `EMBEDDING_MODEL` in `.env` — then **re-ingest every project** (old vectors won’t load against a new model). Re-ranker defaults to `gpt-4o-mini` (`RE_RANKER_MODEL`).
+**Local embeddings** (small models, little VRAM / CPU): set an OpenAI-compatible server and point ingest + query at it:
+
+```env
+EMBEDDING_BACKEND=openai_compatible
+EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1
+EMBEDDING_MODEL=nomic-embed-text
+```
+
+Works with Ollama, LM Studio, vLLM, TEI, etc. Re-ranker still uses OpenRouter by default (`OPENROUTER_API_KEY` + `RE_RANKER_MODEL`); if the key is missing, search skips re-rank and returns hybrid order.
+
+Code-specialized models often beat general ones for C#. Whatever you choose, use the **same** `EMBEDDING_MODEL` for ingest and query — change model ⇒ **re-ingest** all projects.
 
 ## Requirements
 
 - Python 3.10+
 - .NET 9 SDK (for the Roslyn code-graph tool)
-- [OpenRouter](https://openrouter.ai/) API key (embeddings + re-ranker)
+- Embeddings: OpenRouter **or** a local OpenAI-compatible embed server
+- OpenRouter key recommended for LLM re-rank (optional if you accept hybrid-only ranking)
 - Per-game index under `PROJECT_DATABASES/<project_id>/` (you create these; **not** shipped)
 
 ## Setup
@@ -43,7 +54,7 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env → OPENROUTER_API_KEY=...
+# edit .env → OPENROUTER_API_KEY=...  (and optional local EMBEDDING_* — see above)
 
 # Build the C# Roslyn parser (required for full ingest)
 dotnet build tools/roslyn-parser/RoslynCodeGraph.csproj -c Release
@@ -119,6 +130,7 @@ Typical flow: search here → find `Player.TakeDamage` → live patch / set valu
 gamecode-rag/
   gamecode_rag_server.py      # MCP server
   ingest_code_graph.py        # CLI embed + call-graph save
+  embeddings_client.py        # OpenRouter or local OpenAI-compatible embeds
   tools/roslyn-parser/        # C# Roslyn → code_graph.json
   PROJECT_DATABASES/          # your local indexes (gitignored)
   requirements.txt

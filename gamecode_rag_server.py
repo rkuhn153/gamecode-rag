@@ -29,13 +29,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 dotenv_path = os.path.join(BASE_DIR, ".env")
 load_dotenv(dotenv_path=dotenv_path)
 
+# embeddings_client reads env after load_dotenv
+from embeddings_client import (  # noqa: E402
+    EMBEDDING_MODEL,
+    embeddings_ready,
+    fetch_embedding,
+    log_embedding_config,
+)
+
 # ---
 # Configuration
 # ---
-# Default is cheap general-purpose. Code-specialized models (e.g. voyage-code-3) often
-# retrieve better for C#; set EMBEDDING_MODEL and re-ingest all projects if you change it.
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "openai/text-embedding-3-small")
-OPENROUTER_EMBED_URL = "https://openrouter.ai/api/v1/embeddings"
 RE_RANKER_MODEL = os.environ.get("RE_RANKER_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -131,19 +135,13 @@ def load_all_projects():
             logger.warning(f"Skipping directory '{project_id}' (missing db or graph file).")
 
 
-# === UTILITY FUNCTIONS (Unchanged, but now passed DBs) ===
+# === UTILITY FUNCTIONS ===
 
 async def get_real_embedding(client, text: str = ""):
-    if not text.strip(): text = "empty query"
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": EMBEDDING_MODEL, "input": [text]}
     try:
-        response = await client.post(OPENROUTER_EMBED_URL, headers=headers, json=payload, timeout=30.0)
-        response.raise_for_status()
-        data = response.json();
-        return data['data'][0]['embedding']
+        return await fetch_embedding(client, text or "empty query", timeout=30.0)
     except Exception as e:
-        logger.error(f"Error getting query embedding: {e}", exc_info=True);
+        logger.error(f"Error getting query embedding: {e}", exc_info=True)
         return None
 
 
@@ -372,8 +370,10 @@ async def code_search_and_rerank(project_id: str = "", query: str = "") -> str:
         return f"❌ Error: project_id parameter is required. Available projects: {list(GAME_DATABASES.keys())}"
     if not query.strip():
         return "❌ Error: Query parameter is required."
-    if not OPENROUTER_API_KEY:
-        return "❌ Error: OPENROUTER_API_KEY is not set in your .env file."
+
+    ok_embed, embed_err = embeddings_ready()
+    if not ok_embed:
+        return f"❌ Error: embeddings not configured: {embed_err}"
 
     # --- 1. Get the correct project DB ---
     project_data = GAME_DATABASES.get(project_id)
@@ -390,54 +390,54 @@ async def code_search_and_rerank(project_id: str = "", query: str = "") -> str:
             if not broad_search_nodes:
                 return "🔍 No relevant code snippets found for that query."
 
-            # --- 3. AI Re-ranking (Scoring) ---
-            logger.debug(f"Step 2: Sending {len(broad_search_nodes)} nodes to Re-ranker AI...")
-            reranker_system_prompt = "You are an expert at reading code. Your only job is to score code snippets for relevance to a user query. You MUST return ONLY a valid JSON object."
-            reranker_user_prompt = f"User Query: \"{query}\"\n\nHere is a list of {len(broad_search_nodes)} code snippets. Score EACH snippet's relevance from 0.0 to 1.0.\n"
-            reranker_user_prompt += "Return a JSON object where each key is the snippet's 'Id' and the value is its score.\n"
-            reranker_user_prompt += "Example format: {\"AchievementThrower.CheckAllAchievements()\": 0.9, \"Readme.Section\": 0.1, ...}\n\n"
+            # --- 3. AI Re-ranking (optional if no OpenRouter key; fall back to hybrid order) ---
+            if not OPENROUTER_API_KEY:
+                logger.warning("OPENROUTER_API_KEY unset — skipping LLM re-rank, using hybrid order.")
+                winning_nodes = broad_search_nodes[:5]
+            else:
+                logger.debug(f"Step 2: Sending {len(broad_search_nodes)} nodes to Re-ranker AI...")
+                reranker_system_prompt = "You are an expert at reading code. Your only job is to score code snippets for relevance to a user query. You MUST return ONLY a valid JSON object."
+                reranker_user_prompt = f"User Query: \"{query}\"\n\nHere is a list of {len(broad_search_nodes)} code snippets. Score EACH snippet's relevance from 0.0 to 1.0.\n"
+                reranker_user_prompt += "Return a JSON object where each key is the snippet's 'Id' and the value is its score.\n"
+                reranker_user_prompt += "Example format: {\"AchievementThrower.CheckAllAchievements()\": 0.9, \"Readme.Section\": 0.1, ...}\n\n"
 
-            snippet_map_for_prompt = {}
-            for i, node in enumerate(broad_search_nodes):
-                # Use a simple int key for the prompt to save tokens
-                temp_id = f"snippet_{i + 1}"
-                snippet_map_for_prompt[temp_id] = node['Id']  # Map temp ID to real ID
-                reranker_user_prompt += f"--- {temp_id} (ID: {node['Id']}) ---\n{node['Content'][:1000]}...\n\n"
+                snippet_map_for_prompt = {}
+                for i, node in enumerate(broad_search_nodes):
+                    temp_id = f"snippet_{i + 1}"
+                    snippet_map_for_prompt[temp_id] = node['Id']
+                    reranker_user_prompt += f"--- {temp_id} (ID: {node['Id']}) ---\n{node['Content'][:1000]}...\n\n"
 
-            payload = {
-                "model": RE_RANKER_MODEL, "response_format": {"type": "json_object"},
-                "messages": [{"role": "system", "content": reranker_system_prompt},
-                             {"role": "user", "content": reranker_user_prompt}]
-            }
-            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+                payload = {
+                    "model": RE_RANKER_MODEL, "response_format": {"type": "json_object"},
+                    "messages": [{"role": "system", "content": reranker_system_prompt},
+                                 {"role": "user", "content": reranker_user_prompt}]
+                }
+                headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
 
-            response = await client.post(OPENROUTER_CHAT_URL, headers=headers, json=payload, timeout=60.0)
-            response.raise_for_status()
-            scores_str = response.json()['choices'][0]['message']['content']
-            logger.debug(f"Re-ranker AI raw response: {scores_str}")
+                response = await client.post(OPENROUTER_CHAT_URL, headers=headers, json=payload, timeout=60.0)
+                response.raise_for_status()
+                scores_str = response.json()['choices'][0]['message']['content']
+                logger.debug(f"Re-ranker AI raw response: {scores_str}")
 
-            # --- 4. Local Culling ---
-            scores_obj = json.loads(scores_str)
-            scored_ids = []
+                scores_obj = json.loads(scores_str)
+                scored_ids = []
+                for temp_id, score in scores_obj.items():
+                    if temp_id in snippet_map_for_prompt:
+                        real_id = snippet_map_for_prompt[temp_id]
+                        scored_ids.append((float(score), real_id))
 
-            # Use the *prompt's* map to find the *real* IDs
-            for temp_id, score in scores_obj.items():
-                if temp_id in snippet_map_for_prompt:
-                    real_id = snippet_map_for_prompt[temp_id]
-                    scored_ids.append((float(score), real_id))
+                scored_ids.sort(key=lambda x: x[0], reverse=True)
+                top_5_ids = [node_id for score, node_id in scored_ids[:5] if score > 0.1]
 
-            scored_ids.sort(key=lambda x: x[0], reverse=True)
-            top_5_ids = [node_id for score, node_id in scored_ids[:5] if score > 0.1]
+                if not top_5_ids:
+                    logger.warning("Re-ranker AI returned 0 relevant IDs. Using hybrid fallback.")
+                    top_5_ids = [node['Id'] for node in broad_search_nodes[:5]]
 
-            if not top_5_ids:
-                logger.warning("Re-ranker AI returned 0 relevant IDs. Using fallback.")
-                top_5_ids = [node['Id'] for node in broad_search_nodes[:5]]
+                logger.info(f"Re-ranker culled {len(broad_search_nodes)} snippets down to {len(top_5_ids)}.")
+                winning_nodes = [vector_db['metadata'][node_id] for node_id in top_5_ids if
+                                 node_id in vector_db['metadata']]
 
-            logger.info(f"Re-ranker culled {len(broad_search_nodes)} snippets down to {len(top_5_ids)}.")
-            winning_nodes = [vector_db['metadata'][node_id] for node_id in top_5_ids if
-                             node_id in vector_db['metadata']]
-
-            # --- 5. Format and Return ---
+            # --- 4. Format and Return ---
             output = f"✅ Found {len(winning_nodes)} highly relevant code snippets for project '{project_id}':\n"
             for node in winning_nodes:
                 output += format_node_to_string(node)
@@ -753,6 +753,10 @@ async def ingest_new_project(project_id: str = "", source_code_path: str = "", a
 # === SERVER STARTUP ===
 if __name__ == "__main__":
     logger.info("Starting GameCode RAG MCP server (v12 - MULTI-TENANT)...")
+    try:
+        log_embedding_config()
+    except Exception as e:
+        logger.warning("Embedding config: %s", e)
 
     # Load all project DBs into memory
     load_all_projects()
@@ -760,8 +764,11 @@ if __name__ == "__main__":
     if not GAME_DATABASES:
         logger.warning("No projects found in './PROJECT_DATABASES/'. Server will start but tools will fail.")
 
+    ok_embed, embed_err = embeddings_ready()
+    if not ok_embed:
+        logger.warning("Embeddings not ready: %s", embed_err)
     if not OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY is not set in .env file. The server will fail.")
+        logger.warning("OPENROUTER_API_KEY is not set — LLM re-rank disabled (hybrid order only).")
 
     logger.info("Server loaded. Running transport...")
     try:

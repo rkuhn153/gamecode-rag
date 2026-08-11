@@ -16,13 +16,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 dotenv_path = os.path.join(BASE_DIR, ".env")
 load_dotenv(dotenv_path=dotenv_path)
 
-# ---
-# Configuration
-# ---
-# Must match gamecode_rag_server.EMBEDDING_MODEL (or re-ingest after changing).
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "openai/text-embedding-3-small")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+from embeddings_client import (  # noqa: E402
+    EMBEDDING_MODEL,
+    embeddings_ready,
+    fetch_embeddings,
+    log_embedding_config,
+)
 
 # 1 token ~ 4 chars. Model limit is 8192 tokens (~32k chars).
 CONTENT_CHAR_LIMIT = 18000
@@ -44,30 +43,9 @@ RE_CLASS_VARS = re.compile(
     re.MULTILINE)
 
 
-# ---
-# Real Embedding Function (Unchanged)
-# ---
 async def get_real_embeddings_batch(client, texts: list):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {"model": EMBEDDING_MODEL, "input": texts}
-
     try:
-        response = await client.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60.0)
-        response.raise_for_status()
-        data = response.json()
-
-        if "data" in data and data["data"]:
-            return [item['embedding'] for item in data['data']]
-        else:
-            logger.error(f"API returned 200 OK but no 'data' key. Response: {data}")
-            return None
-
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP Error: {e.response.status_code} {e.response.text}")
-        return None
+        return await fetch_embeddings(client, texts, timeout=120.0)
     except Exception as e:
         logger.error(f"Error getting embeddings: {e}", exc_info=True)
         return None
@@ -77,9 +55,11 @@ async def get_real_embeddings_batch(client, texts: list):
 # Main Ingestion Logic
 # ---
 async def main(project_id, source_file_path):
-    if not OPENROUTER_API_KEY:
-        logger.error("FATAL: OPENROUTER_API_KEY not found in .env file.")
+    ok, err = embeddings_ready()
+    if not ok:
+        logger.error("FATAL: %s", err)
         sys.exit(1)
+    log_embedding_config()
 
     # --- 1. Load the C# tool's output ---
     try:
