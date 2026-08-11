@@ -22,6 +22,8 @@ Queries for `code_search_and_rerank` should be **full natural-language questions
 2. **LLM re-rank** — scores the broad set down to a short list  
 3. **Call graph** — optional follow-up via `code_graph_search`
 
+Indexes under `PROJECT_DATABASES/` are **lazy-loaded**: startup only scans folder names; a project’s vectors enter RAM on the **first** search/graph call for that `project_id`.
+
 ### Embedding models
 
 Default: **OpenRouter** + **`openai/text-embedding-3-small`** (cheap, fine for many NL queries).

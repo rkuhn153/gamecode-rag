@@ -58,14 +58,12 @@ logger = logging.getLogger("gamecode-rag-server")
 mcp = FastMCP("gamecode-rag")
 
 # ---
-# NEW: Global State for Multi-Tenant
+# Multi-tenant state (lazy-loaded)
 # ---
-# This will hold all loaded game DBs, e.g.:
-# GAME_DATABASES = {
-#   "another_crabs_treasure": { "db": {...}, "graph": [...] },
-#   "lethal_company": { "db": {...}, "graph": [...] }
-# }
-GAME_DATABASES = {}
+# AVAILABLE_PROJECTS: project_id -> paths (scanned on disk, cheap)
+# GAME_DATABASES: project_id -> {db, graph} only after first use
+AVAILABLE_PROJECTS: dict[str, dict[str, str]] = {}
+GAME_DATABASES: dict[str, dict] = {}
 
 
 def _find_roslyn_parser_exe() -> str | None:
@@ -83,56 +81,100 @@ def _find_roslyn_parser_exe() -> str | None:
     return None
 
 
-# ---
-# Server Startup Event
-# ---
-def load_all_projects():
+def discover_projects() -> dict[str, dict[str, str]]:
     """
-    Scans the 'PROJECT_DATABASES' directory and loads all
-    valid game 'brains' into the GAME_DATABASES dictionary.
+    Scan PROJECT_DATABASES for folders that have both index files.
+    Does **not** load vectors into memory.
     """
-    global GAME_DATABASES
-    GAME_DATABASES = {}  # Clear on reload
-
+    global AVAILABLE_PROJECTS
+    AVAILABLE_PROJECTS = {}
     projects_dir = os.path.join(BASE_DIR, "PROJECT_DATABASES")
     if not os.path.exists(projects_dir):
-        logger.warning(f"'PROJECT_DATABASES' directory not found. No projects will be loaded.")
-        return
+        logger.warning("'PROJECT_DATABASES' directory not found. No projects available yet.")
+        return AVAILABLE_PROJECTS
 
-    logger.info(f"Scanning for projects in: {projects_dir}")
+    logger.info("Scanning for projects (paths only, lazy load): %s", projects_dir)
     for project_id in os.listdir(projects_dir):
         project_path = os.path.join(projects_dir, project_id)
         if not os.path.isdir(project_path):
             continue
-
         db_path = os.path.join(project_path, "rag_vector_db.json")
         graph_path = os.path.join(project_path, "rag_call_graph.json")
-
-        if os.path.exists(db_path) and os.path.exists(graph_path):
-            try:
-                logger.info(f"Loading project '{project_id}'...")
-                with open(db_path, 'r', encoding='utf-8') as f:
-                    db_data = json.load(f)
-                with open(graph_path, 'r', encoding='utf-8') as f:
-                    graph_data = json.load(f)
-
-                # Verify the DB model
-                db_model = db_data.get("model", "N/A")
-                if db_model != EMBEDDING_MODEL:
-                    logger.error(
-                        f"Failed to load project '{project_id}': DB model ({db_model}) does not match server model ({EMBEDDING_MODEL}).")
-                    logger.error("Please re-ingest this project with the new 'ingest_code_graph.py' script.")
-                    continue
-
-                GAME_DATABASES[project_id] = {
-                    "db": db_data,
-                    "graph": graph_data
-                }
-                logger.info(f"Successfully loaded project '{project_id}'.")
-            except Exception as e:
-                logger.error(f"Failed to load project '{project_id}': {e}", exc_info=True)
+        if os.path.isfile(db_path) and os.path.isfile(graph_path):
+            AVAILABLE_PROJECTS[project_id] = {
+                "db_path": db_path,
+                "graph_path": graph_path,
+            }
+            logger.info("Found project '%s' (not loaded until first query)", project_id)
         else:
-            logger.warning(f"Skipping directory '{project_id}' (missing db or graph file).")
+            logger.debug("Skipping '%s' (missing rag_vector_db.json or rag_call_graph.json)", project_id)
+
+    logger.info(
+        "Discovered %d project(s); %d currently in memory",
+        len(AVAILABLE_PROJECTS),
+        len(GAME_DATABASES),
+    )
+    return AVAILABLE_PROJECTS
+
+
+def get_project(project_id: str, *, force_reload: bool = False) -> dict | None:
+    """
+    Return {db, graph} for project_id, loading from disk on first use.
+    Returns None if missing or model mismatch.
+    """
+    global GAME_DATABASES
+    if not project_id:
+        return None
+
+    if not force_reload and project_id in GAME_DATABASES:
+        return GAME_DATABASES[project_id]
+
+    # Refresh disk scan if unknown
+    if project_id not in AVAILABLE_PROJECTS:
+        discover_projects()
+
+    paths = AVAILABLE_PROJECTS.get(project_id)
+    if not paths:
+        return None
+
+    try:
+        logger.info("Lazy-loading project '%s' into memory...", project_id)
+        with open(paths["db_path"], "r", encoding="utf-8") as f:
+            db_data = json.load(f)
+        with open(paths["graph_path"], "r", encoding="utf-8") as f:
+            graph_data = json.load(f)
+
+        db_model = db_data.get("model", "N/A")
+        if db_model != EMBEDDING_MODEL:
+            logger.error(
+                "Project '%s' model mismatch: DB=%s server=%s — re-ingest required.",
+                project_id,
+                db_model,
+                EMBEDDING_MODEL,
+            )
+            return None
+
+        payload = {"db": db_data, "graph": graph_data}
+        GAME_DATABASES[project_id] = payload
+        n_meta = len(db_data.get("metadata", {}))
+        n_vec = len(db_data.get("vectors", {}))
+        logger.info(
+            "Loaded project '%s' (%d metadata nodes, %d vectors)",
+            project_id,
+            n_meta,
+            n_vec,
+        )
+        return payload
+    except Exception as e:
+        logger.error("Failed to load project '%s': %s", project_id, e, exc_info=True)
+        return None
+
+
+def list_project_ids() -> list[str]:
+    """Disk inventory (cheap)."""
+    if not AVAILABLE_PROJECTS:
+        discover_projects()
+    return sorted(AVAILABLE_PROJECTS.keys())
 
 
 # === UTILITY FUNCTIONS ===
@@ -353,13 +395,20 @@ def format_node_to_string(node: dict):
 
 @mcp.tool()
 async def list_available_projects() -> str:
-    """Lists all game code projects that are loaded and available to be queried."""
+    """Lists game code projects on disk (indexes load into memory only when first searched)."""
     logger.info("Executing list_available_projects...")
-    if not GAME_DATABASES:
-        return "❌ No projects are loaded. Please run the ingest script."
+    discover_projects()
+    project_keys = list_project_ids()
+    if not project_keys:
+        return "❌ No projects found. Run ingest (ingest_code_graph.py or ingest_new_project) first."
 
-    project_keys = list(GAME_DATABASES.keys())
-    return f"✅ Available projects: {', '.join(project_keys)}"
+    loaded = [p for p in project_keys if p in GAME_DATABASES]
+    msg = f"✅ Available projects: {', '.join(project_keys)}"
+    if loaded:
+        msg += f"\n(Currently in memory: {', '.join(loaded)})"
+    else:
+        msg += "\n(None loaded yet — first search for a project_id loads that index only.)"
+    return msg
 
 
 @mcp.tool()
@@ -367,7 +416,7 @@ async def code_search_and_rerank(project_id: str = "", query: str = "") -> str:
     """Hybrid search (dense embeddings + keyword/symbol) then AI re-rank for the top C# snippets in a project."""
     logger.info(f"Executing code_search_and_rerank for project='{project_id}', query='{query}'")
     if not project_id.strip():
-        return f"❌ Error: project_id parameter is required. Available projects: {list(GAME_DATABASES.keys())}"
+        return f"❌ Error: project_id parameter is required. Available projects: {list_project_ids()}"
     if not query.strip():
         return "❌ Error: Query parameter is required."
 
@@ -375,10 +424,13 @@ async def code_search_and_rerank(project_id: str = "", query: str = "") -> str:
     if not ok_embed:
         return f"❌ Error: embeddings not configured: {embed_err}"
 
-    # --- 1. Get the correct project DB ---
-    project_data = GAME_DATABASES.get(project_id)
+    # --- 1. Get the correct project DB (lazy-load) ---
+    project_data = get_project(project_id.strip())
     if not project_data:
-        return f"❌ Error: Project '{project_id}' not found. Available projects: {list(GAME_DATABASES.keys())}"
+        return (
+            f"❌ Error: Project '{project_id}' not found or failed to load. "
+            f"Available projects: {list_project_ids()}"
+        )
 
     vector_db = project_data["db"]
 
@@ -453,13 +505,16 @@ async def code_graph_search(project_id: str = "", node_id: str = "", depth: str 
     """Finds functions that call (upstream) or are called by (downstream) a specific function ID in a *specific project*."""
     logger.info(f"Executing code_graph_search for project='{project_id}', node_id='{node_id}'")
     if not project_id.strip():
-        return f"❌ Error: project_id parameter is required. Available projects: {list(GAME_DATABASES.keys())}"
+        return f"❌ Error: project_id parameter is required. Available projects: {list_project_ids()}"
     if not node_id.strip():
         return "❌ Error: node_id parameter is required."
 
-    project_data = GAME_DATABASES.get(project_id)
+    project_data = get_project(project_id.strip())
     if not project_data:
-        return f"❌ Error: Project '{project_id}' not found. Available projects: {list(GAME_DATABASES.keys())}"
+        return (
+            f"❌ Error: Project '{project_id}' not found or failed to load. "
+            f"Available projects: {list_project_ids()}"
+        )
 
     call_graph = project_data["graph"]
     db_metadata = project_data["db"].get("metadata", {})
@@ -737,10 +792,17 @@ async def ingest_new_project(project_id: str = "", source_code_path: str = "", a
             "db": db_data,
             "graph": graph_data
         }
+        AVAILABLE_PROJECTS[project_id] = {
+            "db_path": db_path,
+            "graph_path": graph_path,
+        }
 
         num_nodes = len(db_data.get("metadata", {}))
         num_edges = len(graph_data) if isinstance(graph_data, list) else 0
-        status_parts.append(f"✅ Step 3/3: Project '{project_id}' loaded into memory ({num_nodes} code nodes, {num_edges} call graph edges)")
+        status_parts.append(
+            f"✅ Step 3/3: Project '{project_id}' ready "
+            f"({num_nodes} code nodes, {num_edges} call graph edges; cached in memory)"
+        )
 
     except Exception as e:
         status_parts.append(f"⚠️ Step 3/3: Hot-reload failed ({str(e)}). Restart the RAG server to load the project.")
@@ -758,11 +820,16 @@ if __name__ == "__main__":
     except Exception as e:
         logger.warning("Embedding config: %s", e)
 
-    # Load all project DBs into memory
-    load_all_projects()
+    # Discover project paths only — indexes load on first use
+    discover_projects()
 
-    if not GAME_DATABASES:
-        logger.warning("No projects found in './PROJECT_DATABASES/'. Server will start but tools will fail.")
+    if not AVAILABLE_PROJECTS:
+        logger.warning("No projects found in './PROJECT_DATABASES/'. Server will start; ingest a game first.")
+    else:
+        logger.info(
+            "Lazy load enabled: %d project(s) on disk, 0 in memory until first query.",
+            len(AVAILABLE_PROJECTS),
+        )
 
     ok_embed, embed_err = embeddings_ready()
     if not ok_embed:
