@@ -26,19 +26,19 @@ Indexes under `PROJECT_DATABASES/` are **lazy-loaded**: startup only scans folde
 
 ### Embedding models
 
-Default: **OpenRouter** + **`openai/text-embedding-3-small`** (cheap, fine for many NL queries).
+Default (OpenRouter): **`qwen/qwen3-embedding-8b`** — strong on code/retrieval, long context (~32k), and typically **cheaper** than OpenAI `text-embedding-3-small` on OpenRouter.
 
-**Local embeddings** (small models, little VRAM / CPU): set an OpenAI-compatible server and point ingest + query at it:
+**Local embeddings** (optional): any OpenAI-compatible `/v1/embeddings` server:
 
 ```env
 EMBEDDING_BACKEND=openai_compatible
 EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1
-EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_MODEL=qwen3-embedding:0.6b
 ```
 
 Works with Ollama, LM Studio, vLLM, TEI, etc. Re-ranker still uses OpenRouter by default (`OPENROUTER_API_KEY` + `RE_RANKER_MODEL`); if the key is missing, search skips re-rank and returns hybrid order.
 
-Code-specialized models often beat general ones for C#. Whatever you choose, use the **same** `EMBEDDING_MODEL` for ingest and query — change model ⇒ **re-ingest** all projects.
+Use the **same** `EMBEDDING_MODEL` for ingest and query. Changing models requires **re-ingesting** every project (old indexes won’t load).
 
 ## Requirements
 

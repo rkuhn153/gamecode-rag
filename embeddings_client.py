@@ -25,7 +25,8 @@ import httpx
 logger = logging.getLogger("gamecode-rag-embeddings")
 
 EMBEDDING_BACKEND = os.environ.get("EMBEDDING_BACKEND", "openrouter").strip().lower()
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "openai/text-embedding-3-small")
+# OpenRouter: qwen3-embedding-8b is typically cheaper and stronger on code than text-embedding-3-small.
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen/qwen3-embedding-8b")
 EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "").rstrip("/")
 EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
