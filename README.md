@@ -2,8 +2,15 @@
 
 MCP server for **semantic search + call-graph** over **decompiled Unity Mono** C# codebases.
 
-Use it as the “library” next to **[bepinex-mcp](https://github.com/rkuhn153/bepinex-mcp)** (the live game bridge).  
-**Mono only** — for IL2CPP binaries use a decompiler MCP, not this.
+Use it as the “library” next to the live bridge. **Mono only** — for IL2CPP use the decompiler, not this.
+
+### Related projects (same suite)
+
+| Repo | Role | When |
+|------|------|------|
+| **This** — [gamecode-rag](https://github.com/rkuhn153/gamecode-rag) | Semantic search + call graph over dumped **Mono** C# | Game is **Mono** |
+| [bepinex-mcp](https://github.com/rkuhn153/bepinex-mcp) | Live Unity bridge (get/set/patch/watch) | Game is running with BepInEx |
+| [il2cpp-decompiler](https://github.com/rkuhn153/il2cpp-decompiler) | Static IL2CPP decompile (needs [Il2CppDumper](https://github.com/Perfare/Il2CppDumper)) | Game is **IL2CPP** |
 
 ## What it does
 
@@ -37,6 +44,8 @@ EMBEDDING_MODEL=qwen3-embedding:0.6b
 ```
 
 Works with Ollama, LM Studio, vLLM, TEI, etc. Re-ranker still uses OpenRouter by default (`OPENROUTER_API_KEY` + `RE_RANKER_MODEL`); if the key is missing, search skips re-rank and returns hybrid order.
+
+Default re-ranker: **`deepseek/deepseek-v4-flash`** — typically cheaper and stronger at code relevance than `openai/gpt-4o-mini`. Override with `RE_RANKER_MODEL` if you prefer another OpenRouter chat model.
 
 Use the **same** `EMBEDDING_MODEL` for ingest and query. Changing models requires **re-ingesting** every project (old indexes won’t load).
 
@@ -117,14 +126,15 @@ args = ['C:\path\to\gamecode-rag\gamecode_rag_server.py', "--transport=stdio"]
 enabled = true
 ```
 
-## Pair with bepinex-mcp
+## Pair with the suite
 
 | Need | Server |
 |------|--------|
-| Read Mono game code (offline index) | **gamecode-rag** (this repo) |
+| Read **Mono** game code (offline index) | **gamecode-rag** (this repo) |
 | Change the **running** game | [bepinex-mcp](https://github.com/rkuhn153/bepinex-mcp) |
+| Read **IL2CPP** methods (static decompile) | [il2cpp-decompiler](https://github.com/rkuhn153/il2cpp-decompiler) |
 
-Typical flow: search here → find `Player.TakeDamage` → live patch / set value with bepinex-mcp.
+Typical Mono flow: search here → find `Player.TakeDamage` → live patch with bepinex-mcp.
 
 ## Layout
 
