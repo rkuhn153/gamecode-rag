@@ -20,3 +20,8 @@ venv/
 .vscode/
 *.egg-info/
 .pytest_cache/
+
+# .NET build
+**/bin/
+**/obj/
+*.user

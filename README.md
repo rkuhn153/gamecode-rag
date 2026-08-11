@@ -19,6 +19,7 @@ Queries for `code_search_and_rerank` should be **full natural-language questions
 ## Requirements
 
 - Python 3.10+
+- .NET 9 SDK (for the Roslyn code-graph tool)
 - [OpenRouter](https://openrouter.ai/) API key (embeddings + re-ranker)
 - Per-game index under `PROJECT_DATABASES/<project_id>/` (you create these; **not** shipped)
 
@@ -31,21 +32,28 @@ python -m venv .venv
 pip install -r requirements.txt
 cp .env.example .env
 # edit .env → OPENROUTER_API_KEY=...
+
+# Build the C# Roslyn parser (required for full ingest)
+dotnet build tools/roslyn-parser/RoslynCodeGraph.csproj -c Release
 ```
 
 ### Build an index
 
-1. Produce a `code_graph.json` for a game (Roslyn / your decompile pipeline — nodes + edges of methods).
-2. Ingest:
+**Option A — folder of decompiled `.cs` files**
 
 ```bash
-python ingest_code_graph.py --project-id my_game --source path/to/code_graph.json
+# 1) Roslyn → code_graph.json
+dotnet run --project tools/roslyn-parser -c Release -- \
+  --project-path "D:\path\to\decompiled\Assembly-CSharp" \
+  --output "PROJECT_DATABASES\my_game\code_graph.json"
+
+# 2) Embed + write graph
+python ingest_code_graph.py --project-id my_game --source PROJECT_DATABASES/my_game/code_graph.json
 ```
 
-This writes embeddings under `PROJECT_DATABASES/my_game/`.
+**Option B — MCP one-shot** (`ingest_new_project` with `assembly_path` or `source_code_path`): decompiles via `ilspycmd` when needed, runs Roslyn, then embeds. Needs OpenRouter and a built `RoslynCodeGraph.exe`.
 
-Or use the MCP tool `ingest_new_project` once the server is running (can take a while; needs OpenRouter).
-
+This writes under `PROJECT_DATABASES/my_game/`.
 ### Run the MCP server
 
 ```bash
@@ -86,9 +94,10 @@ Typical flow: search here → find `Player.TakeDamage` → live patch / set valu
 
 ```
 gamecode-rag/
-  gamecode_rag_server.py   # MCP server
-  ingest_code_graph.py     # CLI ingest
-  PROJECT_DATABASES/       # your local indexes (gitignored)
+  gamecode_rag_server.py      # MCP server
+  ingest_code_graph.py        # CLI embed + call-graph save
+  tools/roslyn-parser/        # C# Roslyn → code_graph.json
+  PROJECT_DATABASES/          # your local indexes (gitignored)
   requirements.txt
   .env.example
   Dockerfile

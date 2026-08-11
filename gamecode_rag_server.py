@@ -59,6 +59,21 @@ mcp = FastMCP("gamecode-rag")
 GAME_DATABASES = {}
 
 
+def _find_roslyn_parser_exe() -> str | None:
+    """Locate RoslynCodeGraph (or legacy RagC#) executable next to this repo."""
+    candidates = [
+        os.path.join(BASE_DIR, "tools", "roslyn-parser", "bin", "Release", "net9.0", "RoslynCodeGraph.exe"),
+        os.path.join(BASE_DIR, "tools", "roslyn-parser", "bin", "Debug", "net9.0", "RoslynCodeGraph.exe"),
+        # Legacy sibling layout (Game Modding/RagC#/...)
+        os.path.join(os.path.dirname(BASE_DIR), "RagC#", "RagC#", "bin", "Release", "net9.0", "RagC#.exe"),
+        os.path.join(os.path.dirname(BASE_DIR), "RagC#", "RagC#", "bin", "Debug", "net9.0", "RagC#.exe"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 # ---
 # Server Startup Event
 # ---
@@ -494,16 +509,17 @@ async def ingest_new_project(project_id: str = "", source_code_path: str = "", a
             return f"❌ Error: No .cs files found in '{source_code_path}' or its subdirectories."
 
     # --- Paths ---
-    roslyn_parser_exe = os.path.join(
-        os.path.dirname(BASE_DIR),  # Go up from gamecodeRagC# to Game Modding
-        "RagC#", "RagC#", "bin", "Debug", "net9.0", "RagC#.exe"
-    )
+    roslyn_parser_exe = _find_roslyn_parser_exe()
     project_db_dir = os.path.join(BASE_DIR, "PROJECT_DATABASES", project_id)
     code_graph_output = os.path.join(project_db_dir, "code_graph.json")
     ingest_script = os.path.join(BASE_DIR, "ingest_code_graph.py")
 
-    if not os.path.isfile(roslyn_parser_exe):
-        return f"❌ Error: Roslyn parser not found at: {roslyn_parser_exe}. Please build the RagC# project first (dotnet build in the RagC# directory)."
+    if not roslyn_parser_exe:
+        return (
+            "❌ Error: Roslyn parser not found. Build it with:\n"
+            "  dotnet build tools/roslyn-parser/RoslynCodeGraph.csproj -c Release\n"
+            "Expected: tools/roslyn-parser/bin/Release/net9.0/RoslynCodeGraph.exe"
+        )
     if not os.path.isfile(ingest_script):
         return f"❌ Error: Ingestion script not found at: {ingest_script}"
 
