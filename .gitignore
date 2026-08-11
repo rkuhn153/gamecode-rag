@@ -1,0 +1,22 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local game indexes (large + often derived from game code — build your own)
+PROJECT_DATABASES/**
+!PROJECT_DATABASES/.gitkeep
+code_graph.json
+*_decompiled/
+**/rag_vector_db.json
+**/rag_call_graph.json
+
+# Python / IDE
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+*.egg-info/
+.pytest_cache/
