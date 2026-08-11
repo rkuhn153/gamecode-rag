@@ -39,21 +39,32 @@ dotnet build tools/roslyn-parser/RoslynCodeGraph.csproj -c Release
 
 ### Build an index
 
+**Expect this to take a while.** Indexing a full game is not a quick script:
+
+| Step | What happens | Rough time |
+|------|----------------|------------|
+| Decompile (if needed) | `ilspycmd` dumps `.cs` from `Assembly-CSharp` | Often **minutes**; large Unity games can be slow or need retries |
+| Roslyn graph | Walks every file, builds methods + call edges → `code_graph.json` | Often **several minutes** |
+| Embed + ingest | OpenRouter embeddings for each method/chunk | Often **many minutes to tens of minutes** (size + API rate limits) |
+
+You only do this **once per game** (or when you re-ingest). After that, search is fast. Leave the process running and don’t cancel mid-embed unless you mean to restart from that step.
+
 **Option A — folder of decompiled `.cs` files**
 
 ```bash
-# 1) Roslyn → code_graph.json
+# 1) Roslyn → code_graph.json  (can take several minutes)
 dotnet run --project tools/roslyn-parser -c Release -- \
   --project-path "D:\path\to\decompiled\Assembly-CSharp" \
   --output "PROJECT_DATABASES\my_game\code_graph.json"
 
-# 2) Embed + write graph
+# 2) Embed + call graph  (usually the slowest step)
 python ingest_code_graph.py --project-id my_game --source PROJECT_DATABASES/my_game/code_graph.json
 ```
 
-**Option B — MCP one-shot** (`ingest_new_project` with `assembly_path` or `source_code_path`): decompiles via `ilspycmd` when needed, runs Roslyn, then embeds. Needs OpenRouter and a built `RoslynCodeGraph.exe`.
+**Option B — MCP one-shot** (`ingest_new_project` with `assembly_path` or `source_code_path`): decompiles via `ilspycmd` when needed, runs Roslyn, then embeds. Same long pipeline in one tool call — keep the MCP client open until it finishes. Needs OpenRouter and a built `RoslynCodeGraph.exe`.
 
 This writes under `PROJECT_DATABASES/my_game/`.
+
 ### Run the MCP server
 
 ```bash
